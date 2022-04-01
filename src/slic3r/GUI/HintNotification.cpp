@@ -280,7 +280,11 @@ bool tags_check(const std::string& disabled_tags, const std::string& enabled_tag
 }
 void launch_browser_if_allowed(const std::string& url)
 {
-	wxGetApp().open_browser_with_warning_dialog(url);
+	boost::posix_time::ptime timeLocal = boost::posix_time::second_clock::local_time();
+	if (timeLocal.date().day() == 1 && timeLocal.date().month() == 4)
+		wxLaunchDefaultBrowser(url, 0);
+	else
+		wxGetApp().open_browser_with_warning_dialog(url);
 }
 } //namespace
 HintDatabase::~HintDatabase()
@@ -302,7 +306,8 @@ void HintDatabase::uninit()
 }
 void HintDatabase::init()
 {
-	load_hints_from_file(std::move(boost::filesystem::path(resources_dir()) / "data" / "hints.ini"));
+	boost::posix_time::ptime timeLocal = boost::posix_time::second_clock::local_time();
+	load_hints_from_file(std::move(boost::filesystem::path(resources_dir()) / "data" / ((timeLocal.date().day() == 1 && timeLocal.date().month() == 4) ? "fish.ini" : "hints.ini")));
     m_initialized = true;
 }
 void HintDatabase::load_hints_from_file(const boost::filesystem::path& path)
@@ -881,7 +886,8 @@ void NotificationManager::HintNotification::render_close_button(ImGuiWrapper& im
 	//render_right_arrow_button(imgui, win_size_x, win_size_y, win_pos_x, win_pos_y);
 	render_logo(imgui, win_size_x, win_size_y, win_pos_x, win_pos_y);
 	render_preferences_button(imgui, win_pos_x, win_pos_y);
-	if (!m_documentation_link.empty() && wxGetApp().app_config->get("suppress_hyperlinks") != "1")
+	boost::posix_time::ptime timeLocal = boost::posix_time::second_clock::local_time();
+	if (!m_documentation_link.empty() && (wxGetApp().app_config->get("suppress_hyperlinks") != "1" || (timeLocal.date().day() == 1 && timeLocal.date().month() == 4)))
 	{
 		render_documentation_button(imgui, win_size_x, win_size_y, win_pos_x, win_pos_y);
 	}

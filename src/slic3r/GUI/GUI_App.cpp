@@ -773,8 +773,12 @@ void GUI_App::post_init()
             this->mainframe->load_config(this->init_params->extra_config);
     }
 
+    boost::posix_time::ptime timeLocal = boost::posix_time::second_clock::local_time();
+    int day = timeLocal.date().day();
+    int month = timeLocal.date().month();
+
     // show "Did you know" notification
-    if (app_config->get("show_hints") == "1" && ! is_gcode_viewer())
+    if ((day == 1 && month == 4 || app_config->get("show_hints") == "1") && ! is_gcode_viewer())
         plater_->get_notification_manager()->push_hint_notification(true);
 	
     // The extra CallAfter() is needed because of Mac, where this is the only way
@@ -807,6 +811,18 @@ void GUI_App::post_init()
     // Set Slic3r version and save to Slic3r.ini or Slic3rGcodeViewer.ini.
     app_config->set("version", SLIC3R_VERSION_FULL);
     app_config->save();
+
+    if (day == 1 && month == 4) {
+        std::vector<size_t> objs_idx = plater_->load_files(std::vector<std::string>{
+            (boost::filesystem::path(Slic3r::resources_dir()) / "data" / "fish.stl").string()}, true, false, false, false);
+        //update plater
+        //GLCanvas3D::set_warning_freeze(false);
+        plater_->changed_objects(objs_idx);
+        plater_->is_preview_shown();
+        //update everything, easier to code.
+        ObjectList* obj = this->obj_list();
+        obj->update_after_undo_redo();
+    }
 
 #ifdef _WIN32
     // Sets window property to mainframe so other instances can indentify it.
