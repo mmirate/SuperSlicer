@@ -512,6 +512,17 @@ void ScriptContainer::init(const std::string& tab_key, Tab* tab)
 {
     m_tab = tab;
     const boost::filesystem::path ui_script_file = Slic3r::GUI::get_app_config()->layout_config_path() / (tab_key + ".as");
+    std::string filename = (tab_key + ".as");
+    std::cout << "data_dir() = " << data_dir() << "\n";
+    std::cout << "data_dir exist " << boost::filesystem::path(Slic3r::data_dir()) << "? " << (boost::filesystem::exists(boost::filesystem::path(Slic3r::data_dir())) ? "true" : "false") << "\n";
+    std::cout << "layout_config_path exist " << Slic3r::GUI::get_app_config()->layout_config_path().string() << "? " << (boost::filesystem::exists(Slic3r::GUI::get_app_config()->layout_config_path()) ? "true" : "false") << "\n";
+    std::cout << "ui_script_file exist " << ui_script_file.string() << "? " << (boost::filesystem::exists(ui_script_file) ? "true" : "false") << "\n";
+    std::wcout << L"(utf) ui_script_file exist " << ui_script_file.wstring() << L"? " << (boost::filesystem::exists(ui_script_file) ? L"true" : L"false") << "\n";
+    for (boost::filesystem::directory_entry& entry : boost::filesystem::directory_iterator(Slic3r::GUI::get_app_config()->layout_config_path())) {
+        if (boost::filesystem::is_regular_file(entry.path())) {
+            std::cout << "in the ui dir, there a file with path '" << entry.path().string() << "' and name "<< entry.path().filename().string() << "("<< entry.path().filename().string().length() <<") (is " << filename << " ?: "<<(filename == entry.path().filename().string() ? "true" : "false") << ")\n";
+        }
+    }
     if (boost::filesystem::exists(ui_script_file)) {
         //launch the engine if not yet
         if (m_script_engine.get() == nullptr) {
@@ -621,7 +632,10 @@ void ScriptContainer::init(const std::string& tab_key, Tab* tab)
         //std::cout << "\nres is " << res << "\n";
         m_initialized = true;
     } else {
-        BOOST_LOG_TRIVIAL(error) << "Error, can't find file script '" << ui_script_file.string() << "'";
+        if (tab_key.find("print.as") != std::string::npos)
+            BOOST_LOG_TRIVIAL(error) << "Error, can't find file script '" << ui_script_file.string() << "'";
+        else
+            BOOST_LOG_TRIVIAL(warning) << "Warning, can't find file script '" << ui_script_file.string() << "'";
         m_script_module = nullptr;
         disable();
     }
