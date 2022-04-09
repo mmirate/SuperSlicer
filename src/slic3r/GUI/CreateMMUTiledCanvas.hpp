@@ -31,12 +31,7 @@ namespace GUI {
 
         wxBitmap bmp;
         wxBitmap cache;
-        MyDynamicConfig* conf;
         CreateMMUTiledCanvas* parent;
-
-        std::vector<std::pair<wxColour, int>> all_colours;
-        std::vector<std::pair<wxColour, int>> colours;
-        std::vector<std::pair<wxColour, wxColour>> translate;
 
         BasicDrawPane(wxWindow* parent, MyDynamicConfig* config);
 
@@ -45,8 +40,8 @@ namespace GUI {
 
         void render(wxDC& dc);
 
-        void BasicDrawPane::loadImage(std::string filepath);
-        void BasicDrawPane::redrawImage();
+        void loadImage(std::string filepath);
+        void redrawImage();
 
         // some useful events
         /*
@@ -63,6 +58,71 @@ namespace GUI {
         DECLARE_EVENT_TABLE()
     };
 
+    //color managment
+    // 1: create a ColorEntry per pixel color, add them to sorting list & color list
+    // 1b: create an entry per spool (if set), add them to color list
+    // 2: count pixels
+    // 3: if spool assoc is set, use the spool color as print color (skip if spool unset) and remove it from sorting list & color list
+    // 4: get smallest amount of pixel color, set merged to nearest color and add to it my pixels (and if it has a spool, use the spool) and remove it from sorting list & color list
+    // 5: repeat 5 as long as the color list 
+
+    struct ColorEntry;
+    struct CmbColorAssoc {
+        virtual bool is_auto() = 0;
+        virtual ColorEntry* get_print_color() = 0;
+        virtual wxWindow* get_widget() = 0;
+        virtual wxSizer* get_sizer() = 0;
+        virtual bool is_detached() = 0;
+        virtual void detach() = 0;
+        virtual void attach() = 0;
+        virtual void set_color_index(int idx) = 0;
+    };
+    struct ColorEntry {
+        wxColor real_color;
+        int nb_pixels_real;
+        int nb_pixels_sum;
+        //wxColor merged_auto;
+        ColorEntry* printing_color;
+        CmbColorAssoc* widget_spool;
+        ColorEntry(wxColor color) : real_color(color), nb_pixels_real(0), nb_pixels_sum(0), /*merged_auto(color), */printing_color(nullptr), widget_spool(nullptr){}
+        virtual ~ColorEntry() {
+            if (widget_spool && widget_spool->is_detached()) {
+                //widget_spool->get_sizer()->Clear(true);
+            }
+        }
+        void reset_merge() {
+            nb_pixels_sum = 0;
+        }
+        void reset() {
+            nb_pixels_real = 0;
+            //merged_auto = real_color;
+            reset_merge();
+        }
+        virtual wxColour get_printed_color() const {
+            if (printing_color && printing_color != this)
+                return printing_color->get_printed_color();
+            return real_color;
+        }
+        void refresh_spool() {
+            if (!widget_spool->is_auto()) {
+                printing_color = widget_spool->get_print_color();
+            }
+        }
+        void add_pixel() {
+            nb_pixels_real++;
+            nb_pixels_sum++;
+        }
+
+    };
+
+    struct ColorEntrySpool : public ColorEntry
+    {
+        wxColourPickerCtrl* widget;
+        ColorEntrySpool(wxColourPickerCtrl* spool_widget) : ColorEntry(*wxBLACK), widget(spool_widget) {}
+        wxColour get_printed_color() const override {
+            return widget->GetColour();
+        }
+    };
 class CreateMMUTiledCanvas : public DPIDialog
 {
 
@@ -70,35 +130,45 @@ public:
     CreateMMUTiledCanvas(GUI_App* app, MainFrame* mainframe);
     virtual ~CreateMMUTiledCanvas();
 
-    BasicDrawPane* get_canvas() { return canvas; }
+    void create_main_tab(wxPanel* tab);
+    void create_color_tab(wxPanel* tab);
+
+    BasicDrawPane* get_canvas() { return m_canvas; }
     void refresh_description();
+    int find_extruder(wxColour color);
     
     void close_me(wxCommandEvent& event_args);
 
     void on_dpi_changed(const wxRect& suggested_rect) override;
     void create_geometry(wxCommandEvent& event_args);
 
+    void recompute_colors();
+    void recreate_color_conversion();
+    void refresh_color_conversion(int delete_idx, bool is_add_not_del);
+    wxBoxSizer* all_lines_conversion;
+
+    void load_config();
+    void save_config();
+
     std::shared_ptr<ConfigOptionsGroup> group_size;
     std::shared_ptr<ConfigOptionsGroup> group_colors;
-    MyDynamicConfig conf;
+    MyDynamicConfig m_config;
 
-    wxStaticText* nbExtruders;
-    wxTextCtrl* filename_ctrl;
+    wxStaticText* m_txt_extruder_count;
+    wxTextCtrl* m_filename_ctrl;
 
-    BasicDrawPane* canvas;
+    //std::vector<wxColourPickerCtrl*> m_clr_bts;
+    std::vector<ColorEntrySpool> spools;
+    std::vector<ColorEntry> pixel_colors;
+    std::vector<ColorEntry*> used_colors;
 
-    MainFrame* main_frame;
-    GUI_App* gui_app;
-    wxGridBagSizer* main_sizer;
-    wxGridBagSizer* upper_sizer;
-    wxComboBox* cmb_add_replace;
+    wxPanel* m_color_tab;
 
-    std::regex word_regex;
-    bool update_done = false;
+    BasicDrawPane* m_canvas;
 
-    boost::filesystem::path opened_file;
-
-    bool ready = false;
+    MainFrame* m_main_frame;
+    GUI_App* m_gui_app;
+    bool m_dirty = false;
 
 };
 

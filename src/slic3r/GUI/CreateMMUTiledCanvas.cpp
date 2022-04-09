@@ -7,6 +7,7 @@
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/Format/STL.hpp"
 #include "libslic3r/TriangleMesh.hpp"
+#include "format.hpp"
 #include "GUI.hpp"
 #include "GUI_Utils.hpp"
 #include "GUI_ObjectList.hpp"
@@ -14,6 +15,8 @@
 #include "slic3r/Utils/Http.hpp"
 #include "Tab.hpp"
 #include "../Utils/Http.hpp"
+#include <wx/notebook.h>
+#include "Notebook.hpp"
 
 #include "MainFrame.hpp"
 #include "wxExtensions.hpp"
@@ -28,27 +31,14 @@
 #include <wx/scrolwin.h>
 #include <wx/display.h>
 #include <wx/file.h>
-#include <wx/html/htmlwin.h>
 #include <wx/mimetype.h>
+#include <wx/odcombo.h>
 #include <wx/textctrl.h>
+#include <wx/wrapsizer.h>
 #include "wxExtensions.hpp"
 
-#include <boost/asio.hpp>
-#include <boost/locale.hpp>
-#include <boost/iostreams/device/file_descriptor.hpp>
-#include <boost/iostreams/stream.hpp>
-#include <boost/iostreams/tee.hpp>
-#include <boost/iostreams/filtering_stream.hpp>
-#include <boost/log/trivial.hpp>
-#include <boost/property_tree/ptree.hpp>
-#include <boost/property_tree/json_parser.hpp>
-
-// hack for process.hpp : it uses pid_t to set it as alias of int, but vc_x64_lib (wx thingy) as a '#define pid_t int'
-// and so boost/process has a line 'typedef int int'instead of 'typedef int pid_t' that makes it crash
-// note: don't put it in a header, as it can create problems. Here it's safe enough to be used, as it's just applied for the process.hpp file and this source code.
-#define pid_t pid_t
-#include <boost/process.hpp>
-
+#include <boost/filesystem/path.hpp>
+#include <boost/nowide/fstream.hpp>
 
 #if ENABLE_SCROLLABLE
 static wxSize get_screen_size(wxWindow* window)
@@ -151,7 +141,7 @@ namespace GUI {
          */
 
         BasicDrawPane::BasicDrawPane(wxWindow* parent, MyDynamicConfig* config) :
-        wxPanel(parent), conf(config)
+        wxPanel(parent)
     {
         SetMinSize(wxSize(404, 404));
     }
@@ -213,12 +203,12 @@ namespace GUI {
             return;
         }
 
-        Vec2d offset_dbl = conf->option<ConfigOptionPoint>("offset")->value;
+        Vec2d offset_dbl = parent->m_config.option<ConfigOptionPoint>("offset")->value;
         wxSize offset(std::min(int(offset_dbl.x()), std::max(0, bmp.GetSize().x - 1)), std::min(int(offset_dbl.y()), std::max(0, bmp.GetSize().y - 1)));
-        Vec2d size_dbl = conf->option<ConfigOptionPoint>("size")->value;
+        Vec2d size_dbl = parent->m_config.option<ConfigOptionPoint>("size")->value;
         wxSize size(std::min(int(size_dbl.x()), bmp.GetSize().x - offset.x), std::min(int(size_dbl.y()), bmp.GetSize().y - offset.y));
-        Vec2d pixel_size = conf->option<ConfigOptionPoint>("size_px")->value;
-        double separation = conf->opt_float("separation_xy");
+        Vec2d pixel_size = parent->m_config.option<ConfigOptionPoint>("size_px")->value;
+        double separation = parent->m_config.opt_float("separation_xy");
 
         //compute pixel per mm
         double max_x_mm = (size.x * (pixel_size.x() + separation) - separation);
@@ -237,109 +227,82 @@ namespace GUI {
         int pixels_per_tile_x = std::max(1, int(pixels_per_tile * ratiox));
         int pixels_per_tile_y = std::max(1, int(pixels_per_tile * ratioy));
 
-        bool show_original = parent->conf.option<ConfigOptionBool>("original")->value;
+        bool show_original = parent->m_config.option<ConfigOptionBool>("original")->value;
+        const int color_algo = parent->m_config.option<ConfigOptionInt>("color_comp")->value;
+        bool use_near_color = parent->m_config.option<ConfigOptionBool>("near_color")->value;
+
+        parent->recompute_colors();
+
+        std::unordered_map<int, wxBrush*> col2nearest;
+        for (ColorEntry& c : parent->pixel_colors) {
+            if (c.nb_pixels_real <= 0) continue;
+            wxColour color = c.real_color;
+            if (show_original) {
+                col2nearest[c.real_color.GetRGB()] = wxTheBrushList->FindOrCreateBrush(c.real_color);
+            } else {
+                int idx_extruder = 0;
+                //first check if there is an overide
+                if (c.widget_spool && !c.widget_spool->is_auto()) {
+                    color = c.widget_spool->get_print_color()->get_printed_color();
+                }
+                //get nearest
+                for (int i = 0; i < parent->used_colors.size(); i++) {
+                    if (parent->used_colors[i]->get_printed_color() == color) {
+                        idx_extruder = i;
+                        break;
+                    } else if (use_near_color && (color_dist(color_algo, parent->used_colors[i]->get_printed_color(), color) < color_dist(color_algo, parent->used_colors[idx_extruder]->get_printed_color(), color))) {
+                        idx_extruder = i;
+                    }
+                }
+                color = parent->used_colors[idx_extruder]->get_printed_color();
+                col2nearest[c.real_color.GetRGB()] = wxTheBrushList->FindOrCreateBrush(color);
+            }
+        }
         
-        colours.clear();
-        all_colours.clear();
-        {
-            wxNativePixelData data(bmp);
-            wxNativePixelData::Iterator p(bmp, data);
-            if (offset.y > 0)
-                p.OffsetY(data, offset.y);
-            for (int y = 0; y < size.y; ++y) {
-                wxNativePixelData::Iterator rowStart = p;
-                if (offset.x > 0)
-                    p.OffsetX(data, offset.x);
-                for (int x = 0; x < size.x; x++, ++p) {
-                    wxColour color(p.Red(), p.Green(), p.Blue());
-                    int idx = -1;
-                    for (int i = 0; i < colours.size(); i++) {
-                        if (colours[i].first == color) {
-                            idx = i;
-                            break;
-                        }
-                    }
-                    if (idx < 0) {
-                        idx = colours.size();
-                        colours.push_back({ color,0 });
-                        all_colours.push_back({ color,0 });
-                    }
-                    colours[idx].second++;
-                    all_colours[idx].second++;
-                    if (show_original) {
-                        dc.SetBrush(*wxTheBrushList->FindOrCreateBrush(color));
-                        dc.DrawRectangle(
-                            2 + x * (pixels_separation + pixels_per_tile_x) - pixels_separation,
-                            2 + y * (pixels_separation + pixels_per_tile_y) - pixels_separation,
-                            pixels_per_tile_x,
-                            pixels_per_tile_y);
-                    }
-                }
-                p = rowStart;
-                p.OffsetY(data, 1);
+        wxNativePixelData data(bmp);
+        wxNativePixelData::Iterator p(bmp, data);
+        if (offset.y > 0)
+            p.OffsetY(data, offset.y);
+        for (int y = 0; y < size.y; ++y) {
+            wxNativePixelData::Iterator rowStart = p;
+            if (offset.x > 0)
+                p.OffsetX(data, offset.x);
+            for (int x = 0; x < size.x; x++, ++p) {
+                wxColour color(p.Red(), p.Green(), p.Blue());
+                ////find extruder
+                //if (show_original) {
+                //    dc.SetBrush(*wxTheBrushList->FindOrCreateBrush(color));
+                //} else {
+                //    int idx_extruder = 0;
+                //    //first check if there is an overide
+                //    auto it = col2colentry.find(color.GetRGB());
+                //    if (it != col2colentry.end()) {
+                //        if (it->second->widget_spool && !it->second->widget_spool->is_auto()) {
+                //            color = it->second->widget_spool->get_print_color()->get_printed_color();
+                //        }
+                //    }
+                //    //get nearest
+                //    for (int i = 0; i < parent->used_colors.size(); i++) {
+                //        if (parent->used_colors[i]->get_printed_color() == color) {
+                //            idx_extruder = i;
+                //            break;
+                //        } else if (use_near_color && (color_dist(color_algo, parent->used_colors[i]->get_printed_color(), color) < color_dist(color_algo, parent->used_colors[idx_extruder]->get_printed_color(), color))) {
+                //            idx_extruder = i;
+                //        }
+                //    }
+                //    color = parent->used_colors[idx_extruder]->get_printed_color();
+                //    dc.SetBrush(*wxTheBrushList->FindOrCreateBrush(color));
+                //}
+                dc.SetBrush(*col2nearest[color.GetRGB()]);
+                dc.DrawRectangle(
+                    2 + x * (pixels_separation + pixels_per_tile_x) - pixels_separation,
+                    2 + y * (pixels_separation + pixels_per_tile_y) - pixels_separation,
+                    pixels_per_tile_x,
+                    pixels_per_tile_y);
             }
+            p = rowStart;
+            p.OffsetY(data, 1);
         }
-
-        //re-order and fusion
-        int nb_extruders = dynamic_cast<TabPrinter*>(parent->gui_app->get_tab(Preset::TYPE_PRINTER))->m_extruders_count;
-        bool use_near_color = parent->conf.option<ConfigOptionBool>("near_color")->value;
-        const int color_algo = parent->conf.option<ConfigOptionInt>("color_comp")->value; 
-        std::sort(colours.begin(), colours.end(), [](auto e1, auto e2) { return e1.second > e2.second; });
-        while (use_near_color && colours.size() > nb_extruders) {
-            //move the smallest color into the nearest one
-            int idx_extruder = 0;
-
-            for (int i = 1; i < colours.size() - 1; i++) {
-                if ((color_dist(color_algo, colours[i].first, colours.back().first) < color_dist(color_algo, colours[idx_extruder].first, colours.back().first))) {
-                    idx_extruder = i;
-                }
-            }
-            colours[idx_extruder].second += colours.back().second;
-            colours.erase(colours.end() - 1);
-            std::sort(colours.begin(), colours.end(), [](auto e1, auto e2) { return e1.second > e2.second; });
-        }
-
-        if (!show_original) {
-            wxNativePixelData data(bmp);
-            wxNativePixelData::Iterator p(bmp, data);
-            if (offset.y > 0)
-                p.OffsetY(data, offset.y);
-            for (int y = 0; y < size.y; ++y) {
-                wxNativePixelData::Iterator rowStart = p;
-                if (offset.x > 0)
-                    p.OffsetX(data, offset.x);
-                for (int x = 0; x < size.x; x++, ++p) {
-                    wxColour color(p.Red(), p.Green(), p.Blue());
-                    //change color if asked for
-                    for (int i = 0; i < translate.size(); i++) {
-                        if (translate[i].first == color) {
-                            color = translate[i].second;
-                            break;
-                        }
-                    }
-                    //find extruder
-                    int idx_extruder = 0;
-                    for (int i = 0; i < colours.size() && i < nb_extruders; i++) {
-                        if (colours[i].first == color) {
-                            idx_extruder = i;
-                            break;
-                        } else if (use_near_color && (color_dist(color_algo, colours[i].first, color) < color_dist(color_algo, colours[idx_extruder].first, color))) {
-                            idx_extruder = i;
-                        }
-                    }
-                    color = colours[idx_extruder].first;
-                    dc.SetBrush(*wxTheBrushList->FindOrCreateBrush(color));
-                    dc.DrawRectangle(
-                        2 + x * (pixels_separation + pixels_per_tile_x) - pixels_separation,
-                        2 + y * (pixels_separation + pixels_per_tile_y) - pixels_separation,
-                        pixels_per_tile_x,
-                        pixels_per_tile_y);
-                }
-                p = rowStart;
-                p.OffsetY(data, 1);
-            }
-        }
-        parent->refresh_description();
     }
 
     void BasicDrawPane::loadImage(std::string path) {
@@ -459,9 +422,416 @@ namespace GUI {
 
     };
 
+void CreateMMUTiledCanvas::recompute_colors()
+{
+
+    wxBitmap& bmp = get_canvas()->bmp;
+    if (!bmp.IsOk())
+        return;
+    if (bmp.GetSize().x <= 0 || bmp.GetSize().y <= 0)
+        return;
+    if (bmp.GetWidth() == 0 || bmp.GetHeight() == 0)
+        return;
+
+    Vec2d offset_dbl = m_config.option<ConfigOptionPoint>("offset")->value;
+    wxSize offset(std::min(int(offset_dbl.x()), std::max(0, bmp.GetSize().x - 1)), std::min(int(offset_dbl.y()), std::max(0, bmp.GetSize().y - 1)));
+    Vec2d size_dbl = m_config.option<ConfigOptionPoint>("size")->value;
+    wxSize size(std::min(int(size_dbl.x()), bmp.GetSize().x - offset.x), std::min(int(size_dbl.y()), bmp.GetSize().y - offset.y));
+    Vec2d pixel_size = m_config.option<ConfigOptionPoint>("size_px")->value;
+    double separation = m_config.opt_float("separation_xy");
+
+    //compute pixel per mm
+    double max_x_mm = (size.x * (pixel_size.x() + separation) - separation);
+    double max_y_mm = (size.y * (pixel_size.y() + separation) - separation);
+    float mm_per_pixel = std::max(max_x_mm / (GetSize().x - 4), max_y_mm / (GetSize().y - 4));
+
+    //compute pixel per tile & per separation
+    int pixels_separation = int(separation / mm_per_pixel) + (separation - int(separation / mm_per_pixel) > mm_per_pixel / 2 ? 1 : 0);
+    int ratiox = std::min(1, int(pixel_size.x() / pixel_size.y()));
+    int ratioy = std::min(1, int(pixel_size.y() / pixel_size.x()));
+    int pixels_reste_x = (GetSize().x - 4 - pixels_separation * (size.x - 1));
+    int pixels_reste_y = (GetSize().y - 4 - pixels_separation * (size.y - 1));
+    double pixels_per_tile_dbl_x = (pixels_reste_x / double(size.x * (pixel_size.x() / pixel_size.y())));
+    double pixels_per_tile_dbl_y = (pixels_reste_y / double(size.y * (pixel_size.y() / pixel_size.x())));
+    double pixels_per_tile = std::min(pixels_per_tile_dbl_x, pixels_per_tile_dbl_y);
+    int pixels_per_tile_x = std::max(1, int(pixels_per_tile * ratiox));
+    int pixels_per_tile_y = std::max(1, int(pixels_per_tile * ratioy));
+
+    bool show_original = m_config.option<ConfigOptionBool>("original")->value;
+
+    for (ColorEntry& col : pixel_colors) {
+        col.reset();
+    }
+    // create colors & count pixels
+    {
+        wxNativePixelData data(bmp);
+        wxNativePixelData::Iterator p(bmp, data);
+        if (offset.y > 0)
+            p.OffsetY(data, offset.y);
+        for (int y = 0; y < size.y; ++y) {
+            wxNativePixelData::Iterator rowStart = p;
+            if (offset.x > 0)
+                p.OffsetX(data, offset.x);
+            for (int x = 0; x < size.x; x++, ++p) {
+                wxColour color(p.Red(), p.Green(), p.Blue());
+                int idx = -1;
+                for (int i = 0; i < pixel_colors.size(); i++) {
+                    if (pixel_colors[i].real_color == color) {
+                        idx = i;
+                        break;
+                    }
+                }
+                if (idx < 0) {
+                    idx = pixel_colors.size();
+                    pixel_colors.emplace_back(color);
+                }
+                pixel_colors[idx].add_pixel();
+            }
+            p = rowStart;
+            p.OffsetY(data, 1);
+        }
+    }
+
+    // collect colors to merge
+    bool use_spool = m_config.opt_bool("spool_colors");
+    std::vector<ColorEntry*> old_colors = used_colors;
+    used_colors.clear();
+    for (ColorEntry& col : pixel_colors) {
+        if (col.nb_pixels_real > 0) {
+            used_colors.push_back(&col);
+        }
+    }
+
+    const int color_algo = m_config.option<ConfigOptionInt>("color_comp")->value;
+    bool use_near_color = m_config.option<ConfigOptionBool>("near_color")->value;
+    int nb_extruders = dynamic_cast<TabPrinter*>(m_gui_app->get_tab(Preset::TYPE_PRINTER))->m_extruders_count;
+    // re-order and fusion
+    if (use_spool) {
+        //use only spools first
+        for (ColorEntry& spool : spools)
+            spool.reset();
+        for (ColorEntry* c : used_colors) {
+            if (c->widget_spool && !c->widget_spool->is_auto()) {
+                c->printing_color = c->widget_spool->get_print_color();
+                c->printing_color->nb_pixels_real += c->nb_pixels_sum;
+            } else {
+                c->printing_color = &spools[0];
+                for (int i = 1; i < spools.size(); i++) {
+                    if ((color_dist(color_algo, spools[i].get_printed_color(), c->real_color) < color_dist(color_algo, c->printing_color->get_printed_color(), c->real_color))) {
+                        c->printing_color = &spools[i];
+                    }
+                }
+                c->printing_color->nb_pixels_real += c->nb_pixels_sum;
+            }
+        }
+
+        //then, if too much spools, merge them.
+        used_colors.clear();
+        for (ColorEntry& col : spools) {
+            if (col.nb_pixels_real > 0) {
+                col.nb_pixels_sum = col.nb_pixels_real;
+                used_colors.push_back(&col);
+            }
+        }
+    }
+
+    // merge until nb_extruder is enough
+    std::sort(used_colors.begin(), used_colors.end(), [](ColorEntry* e1, ColorEntry* e2) { return e1->nb_pixels_sum > e2->nb_pixels_sum; });
+    while (use_near_color && used_colors.size() > nb_extruders) {
+        //move the smallest color into the nearest one
+        int idx_extruder = 0;
+        for (int i = 1; i < used_colors.size() - 1; i++) {
+            if ((color_dist(color_algo, used_colors[i]->real_color, used_colors.back()->real_color) < color_dist(color_algo, used_colors[idx_extruder]->real_color, used_colors.back()->real_color))) {
+                idx_extruder = i;
+            }
+        }
+        used_colors[idx_extruder]->nb_pixels_sum += used_colors.back()->nb_pixels_sum;
+        used_colors.back()->reset_merge();
+        used_colors.back()->printing_color = used_colors[idx_extruder];
+        used_colors.erase(used_colors.end() - 1);
+        std::sort(used_colors.begin(), used_colors.end(), [](ColorEntry* e1, ColorEntry* e2) { return e1->nb_pixels_sum > e2->nb_pixels_sum; });
+    }
+
+    if (old_colors != used_colors) {
+        refresh_description();
+        recreate_color_conversion();
+    }
+}
 
 CreateMMUTiledCanvas::~CreateMMUTiledCanvas() {
 
+}
+
+void CreateMMUTiledCanvas::save_config()
+{
+    std::string config_str;
+    for (const std::string& key : m_config.keys())
+        if (!m_config.option(key)->is_nil())
+            config_str += key + " = " + m_config.opt_serialize(key) + "\n";
+
+    boost::filesystem::path path_dir = Slic3r::data_dir();
+    path_dir = path_dir / "generator";
+    if (!boost::filesystem::exists(path_dir))
+        boost::filesystem::create_directories(path_dir);
+    boost::filesystem::path path_ini = path_dir / "config.ini";
+    boost::filesystem::path path_temp = path_dir / "config.ini.temp";
+
+    boost::nowide::ofstream c;
+    c.open(path_temp.string(), std::ios::out | std::ios::trunc);
+    c << config_str;
+#ifdef WIN32
+    // WIN32 specific: The final "rename_file()" call is not safe in case of an application crash, there is no atomic "rename file" API
+    // provided by Windows (sic!). Therefore we save a MD5 checksum to be able to verify file corruption. In addition,
+    // we save the config file into a backup first before moving it to the final destination.
+    c << AppConfig::appconfig_md5_hash_line(config_str);
+#endif
+    c.close();
+#ifdef WIN32
+    // Make a backup of the configuration file before copying it to the final destination.
+    std::string error_message;
+    boost::filesystem::path path_bak = path_dir / "config.ini.bak";
+    // Copy configuration file with PID suffix into the configuration file with "bak" suffix.
+    if (copy_file(path_temp.string(), path_bak.string(), error_message, false) != SUCCESS)
+        BOOST_LOG_TRIVIAL(error) << "Copying from " << path_temp.string() << " to " << path_bak.string() << " failed. Failed to create a backup configuration.";
+#endif
+    // Rename the config atomically.
+    // On Windows, the rename is likely NOT atomic, thus it may fail if PrusaSlicer crashes on another thread in the meanwhile.
+    // To cope with that, we already made a backup of the config on Windows.
+    rename_file(path_temp.string(), path_ini.string());
+    m_dirty = false;
+}
+
+void CreateMMUTiledCanvas::load_config()
+{
+    if (m_config.config_def.options.empty()) {
+        //create defs
+        ConfigOptionDef def;
+
+    //def = ConfigOptionDef();
+    //def.label = L("Image path");
+    //def.type = coString;
+    //def.tooltip = L("If it point to a valid freecad instance (the bin directory or the python executable), you can use the built-in python script to quickly generate geometry.");
+    //def.set_default_value(new ConfigOptionString{ "" });
+    //m_config.config_def.options["freecad_path"] = def;
+    //m_config.set_key_value("freecad_path", def.default_value.get()->clone());
+    //option = group_size->get_option("freecad_path");
+    ////option.opt.full_width = true;
+    //option.opt.width = 50;
+    //group_size->append_single_option_line(option);
+
+
+        def = ConfigOptionDef();
+        def.label = L("Pixels count");
+        def.type = coPoint;
+        def.tooltip = L("Number of pixel in x and y axis to include in the tile.");
+        def.sidetext = L("px");
+        def.min = 0;
+        def.set_default_value(new ConfigOptionPoint{ Vec2d{ 32,32 } });
+        m_config.config_def.options["size"] = def;
+        m_config.set_key_value("size", def.default_value.get()->clone());
+
+        def = ConfigOptionDef();
+        def.label = L("Pixel Size");
+        def.type = coPoint;
+        def.tooltip = L("Size in mm on x and y axis for a pixel");
+        def.sidetext = L("mm");
+        def.min = 0;
+        def.set_default_value(new ConfigOptionPoint{ Vec2d{ 5,5 } });
+        m_config.config_def.options["size_px"] = def;
+        m_config.set_key_value("size_px", def.default_value.get()->clone());
+
+        def = ConfigOptionDef();
+        def.label = L("height");
+        def.type = coFloat;
+        def.tooltip = L("Height of the full object.");
+        def.set_default_value(new ConfigOptionFloat{ 1 });
+        def.sidetext = L("mm");
+        def.min = 0;
+        m_config.config_def.options["height"] = def;
+        m_config.set_key_value("height", def.default_value.get()->clone());
+
+        def = ConfigOptionDef();
+        def.label = L("Offset");
+        def.type = coPoint;
+        def.tooltip = L("First pixel position (top left corner).");
+        def.sidetext = L("mm");
+        def.min = 0;
+        def.set_default_value(new ConfigOptionPoint{ Vec2d{ 140,330 } });
+        m_config.config_def.options["offset"] = def;
+        m_config.set_key_value("offset", def.default_value.get()->clone());
+
+
+        def = ConfigOptionDef();
+        def.label = L("XY plane");
+        def.type = coFloat;
+        def.tooltip = L("Number of mm between pixel tiles.");
+        def.sidetext = L("mm");
+        def.min = 0;
+        def.set_default_value(new ConfigOptionFloat{ 1 });
+        m_config.config_def.options["separation_xy"] = def;
+        m_config.set_key_value("separation_xy", def.default_value.get()->clone());
+
+        def = ConfigOptionDef();
+        def.label = L("Z");
+        def.type = coFloat;
+        def.tooltip = L("Height of the separation");
+        def.sidetext = L("mm");
+        def.min = 0;
+        def.set_default_value(new ConfigOptionFloat{ 0.6 });
+        m_config.config_def.options["separation_z"] = def;
+        m_config.set_key_value("separation_z", def.default_value.get()->clone());
+
+
+        //not implemented yet
+        //def = ConfigOptionDef();
+        //def.label = L("Z Bump");
+        //def.type = coFloat;
+        //def.tooltip = L("If you want to have a 3D shaped tile, set this setting. It's the height diff at the center of the tile.");
+        //def.sidetext = L("mm");
+        //def.set_default_value(new ConfigOptionFloat{ 0 });
+        //m_config.config_def.options["bump"] = def;
+        //m_config.set_key_value("bump", def.default_value.get()->clone());
+
+        def = ConfigOptionDef();
+        def.label = L("Use nearest color");
+        def.type = coBool;
+        def.tooltip = L("If there is not enough extruders configured, use the one with the nearest color.");
+        def.set_default_value(new ConfigOptionBool{ true });
+        m_config.config_def.options["near_color"] = def;
+        m_config.set_key_value("near_color", def.default_value.get()->clone());
+
+        def = ConfigOptionDef();
+        def.label = L("Use real spool colors");
+        def.type = coBool;
+        def.tooltip = L("Use colors from your spools, defined in the second tab.");
+        def.set_default_value(new ConfigOptionBool{ false });
+        m_config.config_def.options["spool_colors"] = def;
+        m_config.set_key_value("spool_colors", def.default_value.get()->clone());
+
+        def = ConfigOptionDef();
+        def.label = L("Comparator");
+        def.type = coInt;
+        def.tooltip = L("Choose how to compare color, to choose what's merged");
+        def.gui_type = ConfigOptionDef::GUIType::i_enum_open;
+        def.enum_values.push_back("0");
+        def.enum_values.push_back("1");
+        def.enum_values.push_back("2");
+        def.enum_labels.push_back("RGB");
+        def.enum_labels.push_back("RGb");
+        def.enum_labels.push_back("Hsv");
+        def.set_default_value(new ConfigOptionInt{ 0 });
+        m_config.config_def.options["color_comp"] = def;
+        m_config.set_key_value("color_comp", def.default_value.get()->clone());
+
+
+        def = ConfigOptionDef();
+        def.label = L("Show original colors");
+        def.type = coBool;
+        def.tooltip = L("The preview show what's going to be generated, but selecte this optio to see the original file.");
+        def.sidetext = L("mm");
+        def.set_default_value(new ConfigOptionBool{ false });
+        m_config.config_def.options["original"] = def;
+        m_config.set_key_value("original", def.default_value.get()->clone());
+
+        def = ConfigOptionDef();
+        def.label = L("Extruders");
+        def.type = coInt;
+        def.min = 1;
+        def.tooltip = L("Shortcut to change the number of extruder quickly. It's not refreshed whenc hanging the real settings, so be careful to don't be confused, for now.");
+        def.set_default_value(new ConfigOptionInt((int)dynamic_cast<TabPrinter*>(this->m_gui_app->get_tab(Preset::TYPE_PRINTER))->m_extruders_count));
+        m_config.config_def.options["extruders"] = def;
+        m_config.set_key_value("extruders", def.default_value.get()->clone());
+
+        def = ConfigOptionDef();
+        def.label = L("Available colors");
+        def.type = coStrings;
+        def.tooltip = L("Colors available for printing (your spools colors)");
+        def.gui_type = ConfigOptionDef::GUIType::color;
+        def.set_default_value(new ConfigOptionStrings{ "#0000FF" });
+        m_config.config_def.options["available_colors"] = def;
+        m_config.set_key_value("available_colors", def.default_value.get()->clone());
+    }
+
+    boost::filesystem::path path_dir = Slic3r::data_dir();
+    path_dir = path_dir / "generator";
+    if (!boost::filesystem::exists(path_dir))
+        return;
+    std::string path = (path_dir / "config.ini").string();
+
+    // 1) Read the complete config file into a boost::property_tree.
+    namespace pt = boost::property_tree;
+    pt::ptree tree;
+    boost::nowide::ifstream ifs;
+    bool                    recovered = false;
+
+    try {
+        ifs.open(path);
+#ifdef WIN32
+        // Verify the checksum of the config file without taking just for debugging purpose.
+        if (!AppConfig::verify_config_file_checksum(ifs))
+            BOOST_LOG_TRIVIAL(info) << "The configuration file " << path <<
+            " has a wrong MD5 checksum or the checksum is missing. This may indicate a file corruption or a harmless user edit.";
+
+        ifs.seekg(0, boost::nowide::ifstream::beg);
+#endif
+        pt::read_ini(ifs, tree);
+    }
+    catch (pt::ptree_error& ex) {
+#ifdef WIN32
+        // The configuration file is corrupted, try replacing it with the backup configuration.
+        ifs.close();
+        std::string backup_path = (path_dir / "config.ini.bak").string();
+        if (boost::filesystem::exists(backup_path)) {
+            // Compute checksum of the configuration backup file and try to load configuration from it when the checksum is correct.
+            boost::nowide::ifstream backup_ifs(backup_path);
+            if (!AppConfig::verify_config_file_checksum(backup_ifs)) {
+                BOOST_LOG_TRIVIAL(error) << format("Both \"%1%\" and \"%2%\" are corrupted. It isn't possible to restore configuration from the backup.", path, backup_path);
+                backup_ifs.close();
+                boost::filesystem::remove(backup_path);
+            } else if (std::string error_message; copy_file(backup_path, path, error_message, false) != SUCCESS) {
+                BOOST_LOG_TRIVIAL(error) << format("Configuration file \"%1%\" is corrupted. Failed to restore from backup \"%2%\": %3%", path, backup_path, error_message);
+                backup_ifs.close();
+                boost::filesystem::remove(backup_path);
+            } else {
+                BOOST_LOG_TRIVIAL(info) << format("Configuration file \"%1%\" was corrupted. It has been succesfully restored from the backup \"%2%\".", path, backup_path);
+                // Try parse configuration file after restore from backup.
+                try {
+                    ifs.open(path);
+                    pt::read_ini(ifs, tree);
+                    recovered = true;
+                }
+                catch (pt::ptree_error& ex) {
+                    BOOST_LOG_TRIVIAL(info) << format("Failed to parse configuration file \"%1%\" after it has been restored from backup: %2%", path, ex.what());
+                }
+            }
+        } else
+#endif // WIN32
+            BOOST_LOG_TRIVIAL(info) << format("Failed to parse configuration file \"%1%\": %2%", path, ex.what());
+        if (!recovered) {
+            // Report the initial error of parsing PrusaSlicer.ini.
+            // Error while parsing config file. We'll customize the error message and rethrow to be displayed.
+            // ! But to avoid the use of _utf8 (related to use of wxWidgets) 
+            // we will rethrow this exception from the place of load() call, if returned value wouldn't be empty
+            /*
+            throw Slic3r::RuntimeError(
+                _utf8(L("Error parsing " SLIC3R_APP_NAME " config file, it is probably corrupted. "
+                        "Try to manually delete the file to recover from the error. Your user profiles will not be affected.")) +
+                "\n\n" + AppConfig::config_path() + "\n\n" + ex.what());
+            */
+            //TODO: emit error message
+        }
+    }
+
+    ConfigSubstitutionContext context(ForwardCompatibilitySubstitutionRule::Disable);
+    // 2) Parse the property_tree, extract the sections and key / value pairs.
+    for (const auto& section : tree) {
+        if (section.second.empty()) {
+            // This may be a top level (no section) entry, or an empty section.
+            std::string data = section.second.data();
+            if (!data.empty())
+                m_config.set_deserialize_nothrow(section.first, data, context);
+        }
+    }
 }
 
 CreateMMUTiledCanvas::CreateMMUTiledCanvas(GUI_App* app, MainFrame* mainframe)
@@ -473,35 +843,110 @@ CreateMMUTiledCanvas::CreateMMUTiledCanvas(GUI_App* app, MainFrame* mainframe)
 //#endif // ENABLE_SCROLLABLE
 {
 
-    this->gui_app = app;
-    this->main_frame = mainframe;
+    this->m_gui_app = app;
+    this->m_main_frame = mainframe;
     SetBackgroundColour(wxSystemSettings::GetColour(wxSYS_COLOUR_WINDOW));
     //SetPosition(wxSize(0, 0));
+
+    load_config();
+
+#ifdef _MSW_DARK_MODE
+    wxBookCtrlBase* tabs;
+    //	if (wxGetApp().dark_mode())
+    tabs = new Notebook(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxNB_TOP | wxTAB_TRAVERSAL | wxNB_NOPAGETHEME | wxNB_DEFAULT);
+    /*	else {
+            tabs = new wxNotebook(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxNB_TOP | wxTAB_TRAVERSAL | wxNB_NOPAGETHEME | wxNB_DEFAULT);
+            tabs->SetBackgroundColour(wxSystemSettings::GetColour(wxSYS_COLOUR_WINDOW));
+        }*/
+#else
+    wxNotebook* tabs = new wxNotebook(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxNB_TOP | wxTAB_TRAVERSAL | wxNB_NOPAGETHEME | wxNB_DEFAULT);
+    tabs->SetBackgroundColour(wxSystemSettings::GetColour(wxSYS_COLOUR_WINDOW));
+#endif
 
     // fonts
     const wxFont& font = wxGetApp().normal_font();
     //const wxFont& bold_font = wxGetApp().bold_font();
     SetFont(font);
 
+    wxPanel* tab_main = new wxPanel(tabs, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBK_LEFT | wxTAB_TRAVERSAL);
+    tabs->AddPage(tab_main, "Preview & settings");
+    tab_main->SetFont(font);
+    create_main_tab(tab_main);
 
-    main_sizer = new wxGridBagSizer(1,1); //(int vgap, int hgap)
-    // |       |_icon_|
-    // |editor_| help |
-    // |_err___|______|
-    // |__bts_________|
+    wxPanel* tab_color = new wxPanel(tabs, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxBK_LEFT | wxTAB_TRAVERSAL);
+    tabs->AddPage(tab_color, "Colors");
+    tab_color->SetFont(font);
+    create_color_tab(tab_color);
+
+
+
+    wxGridBagSizer* main_sizer = new wxGridBagSizer(1,1);
+    main_sizer->Add(tabs, wxGBPosition(1, 1), wxGBSpan(1, 3), wxEXPAND | wxTOP | wxLEFT | wxRIGHT);
+
+    wxButton* bt_create_geometry = new wxButton(this, wxID_APPLY, _(L("Generate")));
+    bt_create_geometry->Bind(wxEVT_BUTTON, &CreateMMUTiledCanvas::create_geometry, this);
+    wxGetApp().UpdateDarkUI(bt_create_geometry);
+    main_sizer->Add(bt_create_geometry, wxGBPosition(2, 1), wxGBSpan(1, 1), wxEXPAND | wxALIGN_LEFT);
+
+    wxButton* bt_close = new wxButton(this, wxID_CLOSE, _(L("Close")));
+    bt_close->Bind(wxEVT_BUTTON, &CreateMMUTiledCanvas::close_me, this);
+    SetAffirmativeId(wxID_CLOSE);
+    wxGetApp().UpdateDarkUI(bt_close);
+    main_sizer->Add(bt_close, wxGBPosition(2, 3), wxGBSpan(1, 1), wxEXPAND | wxALIGN_RIGHT, 5);
+
+    main_sizer->AddGrowableCol(2);
+    main_sizer->AddGrowableRow(1);
+
+    SetSizer(main_sizer);
+    main_sizer->SetSizeHints(this);
+    //wxSize dialog_size(800 * this->scale_factor(), 600 * this->scale_factor());
+    wxDisplay display(wxDisplay::GetFromWindow(m_main_frame));
+    wxRect screen = display.GetClientArea();
+    //dialog_size.x = std::min(dialog_size.x, screen.width - 50);
+    //dialog_size.y = std::min(dialog_size.y, screen.height - 50);
+    if (screen.width > 1500 && screen.height > 1000)
+        this->SetSize(wxSize(1200, 700));
+    else if (screen.width > 2000 && screen.height > 1400)
+        this->SetSize(wxSize(1600, 1000));
+    else
+        Fit();
+
+    //set keyboard shortcut
+    wxAcceleratorEntry entries[2];
+    //entries[0].Set(wxACCEL_CTRL, (int) 'X', bt_create_geometry->GetId());
+    //entries[2].Set(wxACCEL_SHIFT, (int) 'W', wxID_FILE1);
+    //entries[0].Set(wxACCEL_CTRL, WXK_ESCAPE, wxID_CLOSE);
+    //entries[1].Set(wxACCEL_NORMAL, WXK_F5, bt_create_geometry->GetId()); // wxID_FILE1);
+    entries[0].Set(wxACCEL_CTRL, (int) 'G', bt_create_geometry->GetId());
+    //entries[3].Set(wxACCEL_CTRL, (int) 'N', bt_new->GetId());
+    //entries[4].Set(wxACCEL_CTRL | wxACCEL_SHIFT, (int) 'S', bt_save->GetId());
+    //entries[5].Set(wxACCEL_CTRL, (int) 'S', bt_quick_save->GetId());
+    entries[1].Set(wxACCEL_CTRL, WXK_F4, wxID_CLOSE);
+    this->SetAcceleratorTable(wxAcceleratorTable(6, entries));
+
+
+    this->CenterOnParent();
+    //DoCentre(wxVERTICAL);
+}
+
+
+void CreateMMUTiledCanvas::create_main_tab(wxPanel* tab)
+{
+    wxGridBagSizer* main_sizer = new wxGridBagSizer(1, 1); //(int vgap, int hgap)
 
     wxBoxSizer* horiSizer = new wxBoxSizer(wxHORIZONTAL);
-    wxButton* bt_open = new wxButton(this, wxID_ANY, _L("Open") + dots);
+    wxButton* bt_open = new wxButton(tab, wxID_ANY, _L("Open") + dots);
+    wxGetApp().UpdateDarkUI(bt_open);
     horiSizer->Add(bt_open, 0, wxALIGN_CENTER_VERTICAL);
     bt_open->Bind(wxEVT_BUTTON, ([this](wxCommandEvent& e) {
-        if (!boost::filesystem::exists(filename_ctrl->GetValue().ToStdString())) {
+        if (!boost::filesystem::exists(m_filename_ctrl->GetValue().ToStdString())) {
             return;
         }
         //open default program
         wxFileType* ftype = wxTheMimeTypesManager->GetFileTypeFromExtension("png");
         wxFileType* ftypejpg = wxTheMimeTypesManager->GetFileTypeFromExtension("jpg");
         if (ftype) {
-            boost::filesystem::path path(filename_ctrl->GetValue().ToStdString());
+            boost::filesystem::path path(m_filename_ctrl->GetValue().ToStdString());
             path.make_preferred();
             try {
                 wxString command = ftype->GetOpenCommand(path.string());
@@ -554,42 +999,45 @@ CreateMMUTiledCanvas::CreateMMUTiledCanvas(GUI_App* app, MainFrame* mainframe)
                     }
 #endif
                 }
-            }catch(Exception){}
+            }
+            catch (Exception) {}
         }
         }));
-    filename_ctrl = new wxTextCtrl(this, wxID_ANY, "");
-    filename_ctrl->SetMinSize(wxSize(500, 0));
-    horiSizer->Add(filename_ctrl, 0, wxEXPAND | wxALL);
-    wxButton* bt_file = new wxButton(this, wxID_ANY, _L("File") + dots);
+    m_filename_ctrl = new wxTextCtrl(tab, wxID_ANY, "");
+    m_filename_ctrl->SetMinSize(wxSize(500, 0));
+    horiSizer->Add(m_filename_ctrl, 0, wxEXPAND | wxALL);
+    wxButton* bt_file = new wxButton(tab, wxID_ANY, _L("File") + dots);
+    wxGetApp().UpdateDarkUI(bt_file);
     horiSizer->Add(bt_file, 0, wxALIGN_CENTER_VERTICAL);
     bt_file->Bind(wxEVT_BUTTON, ([this](wxCommandEvent& e) {
         wxFileDialog openFileDialog(this, _("Open png file"), "", "",
             "png files (*.png)|*.png", wxFD_OPEN | wxFD_FILE_MUST_EXIST);
         if (openFileDialog.ShowModal() == wxID_CANCEL)
             return;
-        conf.set_key_value("offset", new ConfigOptionPoint(Vec2d(0,0)));
+        m_config.set_key_value("offset", new ConfigOptionPoint(Vec2d(0, 0)));
 
-        this->filename_ctrl->SetValue(openFileDialog.GetPath());
+        this->m_filename_ctrl->SetValue(openFileDialog.GetPath());
         this->get_canvas()->loadImage(openFileDialog.GetPath().ToStdString());
         this->get_canvas()->Refresh();
         }));
-    wxButton* bt_rplace = new wxButton(this, wxID_ANY, _L("r/place") + dots);
+    wxButton* bt_rplace = new wxButton(tab, wxID_ANY, _L("r/place") + dots);
+    wxGetApp().UpdateDarkUI(bt_rplace);
     horiSizer->Add(bt_rplace, 0, wxALIGN_CENTER_VERTICAL);
     bt_rplace->Bind(wxEVT_BUTTON, ([this](wxCommandEvent& e) {
-            GetRPlaceDialog* dialog = new GetRPlaceDialog(this, wxID_ANY, _L("Choose your r/place moment"));
-            int result = dialog->ShowModal();
-            if (result == wxID_OK) {
-                GetRPlaceDialog::last_timestamp = dialog->timestamp;
-                boost::filesystem::path object_path(Slic3r::data_dir());
-                object_path = object_path / "temp" / (std::to_string(dialog->timestamp) + ".png");
-                if (!exists(object_path)) {
-                    get_file_from_web("https://rplace.space/combined/"+ std::to_string(dialog->timestamp) + ".png", object_path);
-                }
-            
-                this->filename_ctrl->SetValue(object_path.string());
-                this->get_canvas()->loadImage(object_path.string());
-                this->get_canvas()->Refresh();
+        GetRPlaceDialog* dialog = new GetRPlaceDialog(this, wxID_ANY, _L("Choose your r/place moment"));
+        int result = dialog->ShowModal();
+        if (result == wxID_OK) {
+            GetRPlaceDialog::last_timestamp = dialog->timestamp;
+            boost::filesystem::path object_path(Slic3r::data_dir());
+            object_path = object_path / "temp" / (std::to_string(dialog->timestamp) + ".png");
+            if (!exists(object_path)) {
+                get_file_from_web("https://rplace.space/combined/" + std::to_string(dialog->timestamp) + ".png", object_path);
             }
+
+            this->m_filename_ctrl->SetValue(object_path.string());
+            this->get_canvas()->loadImage(object_path.string());
+            this->get_canvas()->Refresh();
+        }
         }));
 
     //load default file
@@ -602,185 +1050,80 @@ CreateMMUTiledCanvas::CreateMMUTiledCanvas(GUI_App* app, MainFrame* mainframe)
             get_file_from_web("https://rplace.space/combined/1649112424.png", object_path);
         }
 
-        this->filename_ctrl->SetValue(object_path.string());
+        this->m_filename_ctrl->SetValue(object_path.string());
     }
     main_sizer->Add(horiSizer, wxGBPosition(1, 1), wxGBSpan(1, 2), wxEXPAND | wxALL, 2);
 
 
-    group_size = std::make_shared<ConfigOptionsGroup>(this, "Options", &conf);
+    group_size = std::make_shared<ConfigOptionsGroup>(tab, "Options", &m_config);
     group_size->m_on_change = [this](t_config_option_key opt_key, boost::any value) {
+        m_dirty = true;
         this->get_canvas()->Refresh();// paintNow();
+        this->save_config();
     };
 
     ConfigOptionDef def;
     Option option(def, "");
     Line line = { "", "" };
 
-    //def = ConfigOptionDef();
-    //def.label = L("Image path");
-    //def.type = coString;
-    //def.tooltip = L("If it point to a valid freecad instance (the bin directory or the python executable), you can use the built-in python script to quickly generate geometry.");
-    //def.set_default_value(new ConfigOptionString{ "" });
-    //conf.config_def.options["freecad_path"] = def;
-    //conf.set_key_value("freecad_path", def.default_value.get()->clone());
-    //option = group_size->get_option("freecad_path");
-    ////option.opt.full_width = true;
-    //option.opt.width = 50;
     //group_size->append_single_option_line(option);
 
     //line = { L("Size"), "" };
-
-    def = ConfigOptionDef();
-    def.label = L("Pixels count");
-    def.type = coPoint;
-    def.tooltip = L("Number of pixel in x and y axis to include in the tile.");
-    def.sidetext = L("px");
-    def.min = 0;
-    def.set_default_value(new ConfigOptionPoint{ Vec2d{ 32,32 } });
-    conf.config_def.options["size"] = def;
-    conf.set_key_value("size", def.default_value.get()->clone());
     group_size->append_single_option_line(group_size->get_option("size"));
     //line.append_option(Option(def, "size"));
 
-    def = ConfigOptionDef();
-    def.label = L("Pixel Size");
-    def.type = coPoint;
-    def.tooltip = L("Size in mm on x and y axis for a pixel");
-    def.sidetext = L("mm");
-    def.min = 0;
-    def.set_default_value(new ConfigOptionPoint{ Vec2d{ 5,5 } });
-    conf.config_def.options["size_px"] = def;
-    conf.set_key_value("size_px", def.default_value.get()->clone());
     group_size->append_single_option_line(group_size->get_option("size_px"));
     //line.append_option(Option(def, "size_px"));
 
     //group_size->append_line(line);
 
-    def = ConfigOptionDef();
-    def.label = L("height");
-    def.type = coFloat;
-    def.tooltip = L("Height of the full object.");
-    def.set_default_value(new ConfigOptionFloat{ 1 });
-    def.sidetext = L("mm");
-    def.min = 0;
-    conf.config_def.options["height"] = def;
-    conf.set_key_value("height", def.default_value.get()->clone());
     group_size->append_single_option_line(group_size->get_option("height"));
 
-    def = ConfigOptionDef();
-    def.label = L("Offset");
-    def.type = coPoint;
-    def.tooltip = L("First pixel position (top left corner).");
-    def.sidetext = L("mm");
-    def.min = 0;
-    def.set_default_value(new ConfigOptionPoint{ Vec2d{ 140,330 } });
-    conf.config_def.options["offset"] = def;
-    conf.set_key_value("offset", def.default_value.get()->clone());
     group_size->append_single_option_line(group_size->get_option("offset"));
 
     line = { L("Separation"), "" };
 
-    def = ConfigOptionDef();
-    def.label = L("XY plane");
-    def.type = coFloat;
-    def.tooltip = L("Number of mm between pixel tiles.");
-    def.sidetext = L("mm");
-    def.min = 0;
-    def.set_default_value(new ConfigOptionFloat{ 1 });
-    conf.config_def.options["separation_xy"] = def;
-    conf.set_key_value("separation_xy", def.default_value.get()->clone());
     line.append_option(group_size->get_option("separation_xy"));
 
-    def = ConfigOptionDef();
-    def.label = L("Z");
-    def.type = coFloat;
-    def.tooltip = L("Height of the separation");
-    def.sidetext = L("mm");
-    def.min = 0;
-    def.set_default_value(new ConfigOptionFloat{ 0.6 });
-    conf.config_def.options["separation_z"] = def;
-    conf.set_key_value("separation_z", def.default_value.get()->clone());
     line.append_option(group_size->get_option("separation_z"));
 
     group_size->append_line(line);
 
-    //not implemented yet
-    //def = ConfigOptionDef();
-    //def.label = L("Z Bump");
-    //def.type = coFloat;
-    //def.tooltip = L("If you want to have a 3D shaped tile, set this setting. It's the height diff at the center of the tile.");
-    //def.sidetext = L("mm");
-    //def.set_default_value(new ConfigOptionFloat{ 0 });
-    //conf.config_def.options["bump"] = def;
-    //conf.set_key_value("bump", def.default_value.get()->clone());
     //group_size->append_single_option_line(group_size->get_option("bump"));
 
     group_size->activate([]() {}, wxALIGN_RIGHT);
+    group_size->reload_config();
     group_size->update_visibility(comSimple);
     main_sizer->Add(group_size->sizer, wxGBPosition(2, 2), wxGBSpan(1, 1), wxEXPAND | wxALL, 2);
 
 
-    group_colors = std::make_shared<ConfigOptionsGroup>(this, "Colors", &conf);
+    group_colors = std::make_shared<ConfigOptionsGroup>(tab, "Colors", &m_config);
     group_colors->m_on_change = [this](t_config_option_key opt_key, boost::any value) {
         if ("extruders" == opt_key) {
-            dynamic_cast<TabPrinter*>(this->gui_app->get_tab(Preset::TYPE_PRINTER))->extruders_count_changed(boost::any_cast<int>(value));
+            dynamic_cast<TabPrinter*>(this->m_gui_app->get_tab(Preset::TYPE_PRINTER))->extruders_count_changed(boost::any_cast<int>(value));
         }
+        m_dirty = true;
         this->get_canvas()->Refresh();// paintNow();
+        this->save_config();
     };
 
     line = { L("Separation"), "" };
 
-    def = ConfigOptionDef();
-    def.label = L("Use nearest color");
-    def.type = coBool;
-    def.tooltip = L("If there is not enough extruders configured, use the one with the nearest color.");
-    def.sidetext = L("mm");
-    def.set_default_value(new ConfigOptionBool{ true });
-    conf.config_def.options["near_color"] = def;
-    conf.set_key_value("near_color", def.default_value.get()->clone());
-    line.append_option(group_colors->get_option("near_color"));
+    line.append_option(group_colors->get_option("spool_colors"));
 
-    def = ConfigOptionDef();
-    def.label = L("Comparator");
-    def.type = coInt;
-    def.tooltip = L("Choose how to compare color, to choose what's merged");
-    def.gui_type = ConfigOptionDef::GUIType::i_enum_open;
-    def.enum_values.push_back("0");
-    def.enum_values.push_back("1");
-    def.enum_values.push_back("2");
-    def.enum_labels.push_back("RGB");
-    def.enum_labels.push_back("RGb");
-    def.enum_labels.push_back("Hsv");
-    def.set_default_value(new ConfigOptionInt{ 0 });
-    conf.config_def.options["color_comp"] = def;
-    conf.set_key_value("color_comp", def.default_value.get()->clone());
+    line.append_option(group_colors->get_option("near_color"));
+    
     line.append_option(group_colors->get_option("color_comp"));
 
     group_colors->append_line(line);
 
-    def = ConfigOptionDef();
-    def.label = L("Show original colors");
-    def.type = coBool;
-    def.tooltip = L("The preview show what's going to be generated, but selecte this optio to see the original file.");
-    def.sidetext = L("mm");
-    def.set_default_value(new ConfigOptionBool{ false });
-    conf.config_def.options["original"] = def;
-    conf.set_key_value("original", def.default_value.get()->clone());
     group_colors->append_single_option_line(group_colors->get_option("original"));
 
-    def = ConfigOptionDef();
-    def.label = L("Extruders");
-    def.type = coInt;
-    def.min = 1;
-    def.tooltip = L("Shortcut to change the number of extruder quickly. It's not refreshed whenc hanging the real settings, so be careful to don't be confused, for now.");
-    def.set_default_value(new ConfigOptionInt( (int)dynamic_cast<TabPrinter*>(this->gui_app->get_tab(Preset::TYPE_PRINTER))->m_extruders_count ));
-    conf.config_def.options["extruders"] = def;
-    conf.set_key_value("extruders", def.default_value.get()->clone());
     group_colors->append_single_option_line(group_colors->get_option("extruders"));
 
     //line = { "", "" };
     //line.full_width = 1;
-    nbExtruders = new wxStaticText(this, wxID_ANY, "test", wxDefaultPosition, wxDefaultSize);
+    m_txt_extruder_count = new wxStaticText(tab, wxID_ANY, "test", wxDefaultPosition, wxDefaultSize);
     //line.widget = [this](wxWindow* parent) {
     //    auto sizer = new wxBoxSizer(wxHORIZONTAL);
     //    sizer->Add(nbExtruders, 1, wxEXPAND | wxALL, 0);
@@ -799,70 +1142,306 @@ CreateMMUTiledCanvas::CreateMMUTiledCanvas(GUI_App* app, MainFrame* mainframe)
 
 
     group_colors->activate([]() {}, wxALIGN_RIGHT);
+    group_colors->reload_config();
     group_colors->update_visibility(comSimple);
     main_sizer->Add(group_colors->sizer, wxGBPosition(3, 2), wxGBSpan(1, 1), wxEXPAND | wxALL, 2);
 
-    main_sizer->Add(nbExtruders, wxGBPosition(4, 2), wxGBSpan(1, 1), wxEXPAND | wxALL, 2);
+    main_sizer->Add(m_txt_extruder_count, wxGBPosition(4, 2), wxGBSpan(1, 1), wxEXPAND | wxALL, 2);
 
 
-    canvas = new BasicDrawPane(this, &this->conf);
-    canvas->parent = this;
-    this->get_canvas()->loadImage(filename_ctrl->GetValue().ToStdString());
+    m_canvas = new BasicDrawPane(tab, &this->m_config);
+    m_canvas->parent = this;
+    this->get_canvas()->loadImage(m_filename_ctrl->GetValue().ToStdString());
 
-    main_sizer->Add(canvas, wxGBPosition(2, 1), wxGBSpan(3, 1), wxEXPAND | wxALL, 2);
+    main_sizer->Add(m_canvas, wxGBPosition(2, 1), wxGBSpan(3, 1), wxEXPAND | wxALL, 2);
     main_sizer->AddGrowableCol(1);
     main_sizer->AddGrowableRow(4);
+
+    tab->SetSizer(main_sizer);
+}
+
+
+class MywxColourPickerCtrl : public wxColourPickerCtrl {
+public:
+    static inline CreateMMUTiledCanvas* s_main_app = nullptr;
+
+    MywxColourPickerCtrl(const std::string& col) : wxColourPickerCtrl(s_main_app->m_color_tab, wxID_ANY, wxColour(wxString(col))) { }
+    static void save_all_colors() {
+        std::vector<std::string> colors;
+        for (ColorEntrySpool& ces : s_main_app->spools) colors.push_back(wxString::Format(wxT("#%02X%02X%02X"), ces.get_printed_color().Red(), ces.get_printed_color().Green(), ces.get_printed_color().Blue()).ToStdString());
+        s_main_app->m_config.set_key_value("available_colors", new ConfigOptionStrings(colors));
+        s_main_app->save_config();
+    }
+
+    static MywxColourPickerCtrl* add_color_bt(const std::string& color, wxSizer* sizer) {
+        MywxColourPickerCtrl* clr_bt = new MywxColourPickerCtrl(color);
+        s_main_app->spools.emplace_back(clr_bt);
+        clr_bt->Bind(wxEVT_COLOURPICKER_CHANGED, ([](wxCommandEvent& e) {
+            s_main_app->refresh_color_conversion(-1, false);
+            MywxColourPickerCtrl::save_all_colors();
+        }));
+        clr_bt->GetPickerCtrl()->Bind(wxEVT_RIGHT_DOWN, ([clr_bt, sizer](wxMouseEvent& e) {
+            //remove this color
+            for (int i = 0; i < s_main_app->spools.size(); i++) {
+                if (s_main_app->spools[i].widget == clr_bt && sizer->GetItem(i)->GetWindow() == clr_bt) {
+                    s_main_app->spools.erase(s_main_app->spools.begin() + i);
+                    s_main_app->refresh_color_conversion(i, false);
+                    sizer->Detach(i);
+                    break;
+                }
+            }
+            //save alls
+            MywxColourPickerCtrl::save_all_colors();
+            clr_bt->Destroy();
+            s_main_app->m_color_tab->GetSizer()->Layout();
+            s_main_app->m_color_tab->Refresh();
+        }));
+        sizer->Add(clr_bt, wxSizerFlags().Left());
+        if(s_main_app->m_color_tab->GetSizer())
+            s_main_app->refresh_color_conversion(s_main_app->spools.size()-1, true);
+        return clr_bt;
+    }
+
+};
+
+class MywxOwnerDrawnComboBox : public wxOwnerDrawnComboBox, public CmbColorAssoc {
+public:
+    int idx = 0;
+    CreateMMUTiledCanvas* m_main_app;
+    wxBoxSizer* m_line;
+    bool is_attached = false;
+
+    bool is_auto() override {
+        return GetSelection() == 0;
+    }
+    ColorEntry* get_print_color() override {
+        if (is_auto()) {
+            return nullptr;
+        } else {
+            int item = GetSelection();
+            return &m_main_app->spools[item - 1];
+        }
+    }
+    wxWindow* get_widget() {
+        return this;
+    }
+    wxSizer* get_sizer() override {
+        return m_line;
+    }
+    bool is_detached() override {
+        return !is_attached;
+    }
+
+    void detach() override {
+        m_main_app->all_lines_conversion->Detach(m_line);
+        is_attached = false;
+    }
+    void attach() override {
+        m_main_app->all_lines_conversion->Add(m_line, wxEXPAND | wxHORIZONTAL);
+        is_attached = true;
+    }
+
+    void set_color_index(int new_idx) override {
+        idx = new_idx;
+    }
+
+    MywxOwnerDrawnComboBox(CreateMMUTiledCanvas* main, wxBoxSizer* line, wxString label, int idx) : wxOwnerDrawnComboBox(main->m_color_tab, wxID_ANY, label), m_line(line), m_main_app(main), idx(idx){}
+
+    void OnDrawItem(wxDC& dc, const wxRect& rect, int item, int flags) const override {
+        if (item == 0) {
+            dc.SetBrush(*wxWHITE_BRUSH);
+            dc.DrawRectangle(rect);
+            dc.SetBrush(*wxBLACK_BRUSH);
+            dc.DrawLabel(_L("Automatic"), rect, wxALIGN_CENTER_HORIZONTAL | wxALIGN_CENTER_VERTICAL);
+        } else {
+            if (item-1 < m_main_app->spools.size()) {
+                dc.SetBrush(*wxTheBrushList->FindOrCreateBrush(m_main_app->spools[item-1].get_printed_color()));
+                dc.DrawRectangle(rect);
+            } else {
+                dc.SetBrush(*wxBLACK_BRUSH);
+                dc.DrawRectangle(rect);
+            }
+        }
+    }
+    wxCoord OnMeasureItem(size_t item) const override {
+        return wxCoord(40);
+    }
+    wxCoord OnMeasureItemWidth(size_t item) const override {
+        return wxCoord(120);
+    }
+
+    void refresh_auto_color() {
+        if (is_auto()) {
+            wxColour colour_real = m_main_app->used_colors[m_main_app->find_extruder(m_main_app->pixel_colors[idx].get_printed_color())]->get_printed_color();
+            SetBackgroundColour(colour_real);
+        } else {
+            int item = GetSelection();
+            wxColour colour_real = m_main_app->spools[item - 1].get_printed_color();
+            SetBackgroundColour(colour_real);
+        }
+    }
+
+};
+
+int CreateMMUTiledCanvas::find_extruder(wxColour color) {
+    int nb_extruders = dynamic_cast<TabPrinter*>(this->m_gui_app->get_tab(Preset::TYPE_PRINTER))->m_extruders_count;
+    const int color_algo = m_config.option<ConfigOptionInt>("color_comp")->value;
+    bool use_near_color = m_config.option<ConfigOptionBool>("near_color")->value;
+    int idx_extruder = 0;
+    for (int i = 0; i < used_colors.size() && i < nb_extruders; i++) {
+        if (used_colors[i]->get_printed_color() == color) {
+            idx_extruder = 1 + i;
+            break;
+        } else if (use_near_color && (idx_extruder <= 0 || (color_dist(color_algo, used_colors[i]->get_printed_color(), color) < color_dist(color_algo, used_colors[idx_extruder - 1]->get_printed_color(), color)))) {
+            idx_extruder = 1 + i;
+        }
+    }
+    return idx_extruder;
+}
+
+void CreateMMUTiledCanvas::recreate_color_conversion()
+{
+    auto create_line = [this](ColorEntry* col_entry, int index) {
+        wxBoxSizer* line = new wxBoxSizer(wxHORIZONTAL);
+        wxStaticText* col_start = new wxStaticText(m_color_tab, wxID_ANY, "");
+        col_start->SetSize(80, 20);
+        col_start->SetMinSize(wxSize(80, 20));
+        col_start->SetBackgroundColour(col_entry->real_color);
+        line->Add(col_start);
+        //wxCheckBox* chk_auto = new wxCheckBox(tab, wxID_ANY, "Auto");
+        //chk_auto->SetValue(true);
+        //line->Add(chk_auto);
+        line->Add(new wxStaticText(m_color_tab, wxID_ANY, _L("Choose specific spool color:")));
+        
+        MywxOwnerDrawnComboBox* clr_set = new MywxOwnerDrawnComboBox(this, line, _L("Automatic"), index);
+        clr_set->Append(_L("Automatic"));
+        for (int i = 0; i < this->spools.size(); i++) {
+            clr_set->Append(std::to_string(i + 1));
+        }
+        clr_set->SetSelection(0);
+        clr_set->Bind(wxEVT_COMBOBOX, [this, clr_set](wxCommandEvent&) {
+            if (clr_set->is_auto()) {
+                clr_set->SetBackgroundColour(*wxWHITE);
+            } else {
+                int id = clr_set->GetSelection();
+                clr_set->SetBackgroundColour(this->spools[id - 1].get_printed_color());
+            }
+            clr_set->Refresh();
+            });
+        line->Add(clr_set);
+        col_entry->widget_spool = clr_set;
+    };
+
+    std::vector<ColorEntry*> used;
+    for (int idx = 0; idx < pixel_colors.size(); idx++) {
+        ColorEntry& c = pixel_colors[idx];
+        if (c.nb_pixels_real > 0) {
+            used.push_back(&c);
+            if (!c.widget_spool) {
+                create_line(&c, idx);
+            }
+        }
+        // detach all
+        if(c.widget_spool && !c.widget_spool->is_detached()){
+            c.widget_spool->detach();
+        }
+    }
     
-    wxStdDialogButtonSizer* buttons = new wxStdDialogButtonSizer();
+    // order
+    std::sort(used.begin(), used.end(), [](ColorEntry* e1, ColorEntry* e2) { return e1->nb_pixels_real > e2->nb_pixels_real; });
 
-    buttons->AddStretchSpacer();
-    wxButton* bt_create_geometry = new wxButton(this, wxID_APPLY, _(L("Generate")));
-    bt_create_geometry->Bind(wxEVT_BUTTON, &CreateMMUTiledCanvas::create_geometry, this);
-    buttons->SetAffirmativeButton(bt_create_geometry);
-    bt_create_geometry->SetDefault();
-    bt_create_geometry->SetFocus();
-    buttons->Realize();
-    main_sizer->Add(buttons, wxGBPosition(5, 1), wxGBSpan(1, 1), wxEXPAND, 5);
+    // attach/create
+    for (ColorEntry* c : used) {
+        c->widget_spool->attach();
+    }
 
-    wxButton* close = new wxButton(this, wxID_CLOSE, _(L("Close")));
-    close->Bind(wxEVT_BUTTON, &CreateMMUTiledCanvas::close_me, this);
-    SetAffirmativeId(wxID_CLOSE);
-    main_sizer->Add(close, wxGBPosition(5, 2), wxGBSpan(1, 1), wxEXPAND | wxALIGN_RIGHT, 5);
+}
 
-    SetSizer(main_sizer);
-    main_sizer->SetSizeHints(this);
+//refresh color from comboboxes & destroyed links
+void CreateMMUTiledCanvas::refresh_color_conversion(int del_idx, bool is_add_not_del) {
+    for (int i = 0; i < pixel_colors.size(); i++) {
+        ColorEntry& c = pixel_colors[i];
+        if (c.widget_spool && !c.widget_spool->is_detached()) {
+            MywxOwnerDrawnComboBox* clr_set = (MywxOwnerDrawnComboBox*)c.widget_spool->get_widget();
+            clr_set->m_line->GetChildren().front()->GetWindow()->SetBackgroundColour(c.real_color);
+            if (del_idx < 0) {
+                //just refresh
+                if (clr_set->is_auto()) {
+                    clr_set->SetBackgroundColour(*wxWHITE);
+                } else {
+                    int id = clr_set->GetSelection();
+                    clr_set->SetBackgroundColour(this->spools[id - 1].get_printed_color());
+                }
+                clr_set->Refresh();
+            } else if(!is_add_not_del){
+                if (!clr_set->is_auto()) {
+                    int id = clr_set->GetSelection();
+                    if (id - 1 == del_idx) {
+                        clr_set->Select(0);
+                    } else if (id - 1 > del_idx) {
+                        clr_set->Select(id - 1);
+                    }
+                }
+            } else if (is_add_not_del) {
+                clr_set->Append(std::to_string(this->spools.size()));
+            }
+        }
+    }
+    if (m_color_tab->GetSizer()) {
+        m_color_tab->GetSizer()->Layout();
+        m_color_tab->Refresh();
+    }
+}
+
+void CreateMMUTiledCanvas::create_color_tab(wxPanel* tab)
+{
+    m_color_tab = tab;
+    MywxColourPickerCtrl::s_main_app = this;
+
+    wxGridBagSizer* color_sizer = new wxGridBagSizer(1, 1); //(int vgap, int hgap)
+
+    wxWrapSizer* color_row_sizer = new wxWrapSizer(wxHORIZONTAL);
+    wxBoxSizer* first_line = new wxBoxSizer(wxHORIZONTAL);
+    wxButton* bt_new_color = new wxButton(tab, wxID_ANY, _L("Add one") + dots);
+    wxGetApp().UpdateDarkUI(bt_new_color);
+    bt_new_color->Bind(wxEVT_BUTTON, ([this, color_row_sizer](wxCommandEvent& e) {
+        MywxColourPickerCtrl::add_color_bt("#000000", color_row_sizer);
+        m_color_tab->GetSizer()->Layout();
+        m_color_tab->Refresh();
+        MywxColourPickerCtrl::save_all_colors();
+
+    }));
+    first_line->Add(new wxStaticText(tab, wxID_ANY, _L("Available filament colors in your spools (right clic to delete)")), wxSizerFlags().Left());
+    first_line->Add(bt_new_color, wxSizerFlags().Left());
+    color_sizer->Add(first_line, wxGBPosition(1, 1), wxGBSpan(1, 2), wxEXPAND | wxALL, 2);
+
+    //row of available colors
+    //group_colors->append_single_option_line(group_colors->get_option("available_colors"));
+    ConfigOptionStrings* available_colors = m_config.option<ConfigOptionStrings>("available_colors");
+    for (int i = 0; i < available_colors->values.size(); i++) {
+        MywxColourPickerCtrl::add_color_bt(available_colors->values[i], color_row_sizer);
+    }
+    tab->Refresh();
+    color_sizer->Add(color_row_sizer, wxGBPosition(2, 1), wxGBSpan(1, 2), wxEXPAND | wxALL, 2);
 
 
-    //wxSize dialog_size(800 * this->scale_factor(), 600 * this->scale_factor());
-    wxDisplay display(wxDisplay::GetFromWindow(main_frame));
-    wxRect screen = display.GetClientArea();
-    //dialog_size.x = std::min(dialog_size.x, screen.width - 50);
-    //dialog_size.y = std::min(dialog_size.y, screen.height - 50);
-    if (screen.width > 1500 && screen.height > 1000)
-        this->SetSize(wxSize(1200, 700));
-    else if (screen.width > 2000 && screen.height > 1400)
-        this->SetSize(wxSize(1600, 1000));
-    else
-        Fit();
+    color_sizer->Add(new wxStaticText(tab, wxID_ANY, _L("For each needed color, chose the spool color (or let the algorithm choose)")), wxGBPosition(3, 1), wxGBSpan(1, 2), wxEXPAND | wxALL, 2);
 
-    //set keyboard shortcut
-    wxAcceleratorEntry entries[1];
-    //entries[0].Set(wxACCEL_CTRL, (int) 'X', bt_create_geometry->GetId());
-    //entries[2].Set(wxACCEL_SHIFT, (int) 'W', wxID_FILE1);
-    //entries[0].Set(wxACCEL_CTRL, WXK_ESCAPE, wxID_CLOSE);
-    //entries[1].Set(wxACCEL_NORMAL, WXK_F5, bt_create_geometry->GetId()); // wxID_FILE1);
-    entries[0].Set(wxACCEL_CTRL, (int) 'G', bt_create_geometry->GetId());
-    //entries[3].Set(wxACCEL_CTRL, (int) 'N', bt_new->GetId());
-    //entries[4].Set(wxACCEL_CTRL | wxACCEL_SHIFT, (int) 'S', bt_save->GetId());
-    //entries[5].Set(wxACCEL_CTRL, (int) 'S', bt_quick_save->GetId());
-    this->SetAcceleratorTable(wxAcceleratorTable(6, entries));
+    //color convertion
+    all_lines_conversion = new wxBoxSizer(wxVERTICAL);
+    color_sizer->Add(all_lines_conversion, wxGBPosition(4, 1), wxGBSpan(1, 2), wxEXPAND | wxHORIZONTAL | wxALIGN_TOP | wxALIGN_LEFT, 2);
 
-    DoCentre(wxVERTICAL);
+
+    color_sizer->AddGrowableCol(2);
+    color_sizer->AddGrowableRow(3);
+
+    tab->SetSizer(color_sizer);
+
 }
 
 void CreateMMUTiledCanvas::refresh_description() {
-    std::string descrp = "To print all colors, you need " + std::to_string(canvas->all_colours.size()) + " extruders";
-    nbExtruders->SetLabelText(descrp);
+    std::string descrp = "To print all colors, you need " + std::to_string(used_colors.size()) + " extruders";
+    m_txt_extruder_count->SetLabelText(descrp);
 }
 
 void CreateMMUTiledCanvas::on_dpi_changed(const wxRect& suggested_rect)
@@ -876,7 +1455,9 @@ void CreateMMUTiledCanvas::on_dpi_changed(const wxRect& suggested_rect)
 }
 
 void CreateMMUTiledCanvas::close_me(wxCommandEvent& event_args) {
-    this->gui_app->change_calibration_dialog(this, nullptr);
+    //save conf
+
+    this->m_gui_app->change_calibration_dialog(this, nullptr);
     this->Destroy();
 }
 
@@ -884,7 +1465,7 @@ void CreateMMUTiledCanvas::create_geometry(wxCommandEvent& event_args) {
 
 
     //create the base
-    Plater* plat = this->main_frame->plater();
+    Plater* plat = this->m_main_frame->plater();
     plat->take_snapshot(_L("Create Tile"));
     Model& model = plat->model();
     //if (!plat->new_project(L("Tile")))
@@ -892,18 +1473,18 @@ void CreateMMUTiledCanvas::create_geometry(wxCommandEvent& event_args) {
     model.clear_objects();
     plat->set_project_filename(L("Mosaic"));
 
-    const DynamicPrintConfig* print_config = this->gui_app->get_tab(Preset::TYPE_FFF_PRINT)->get_config();
-    const DynamicPrintConfig* filament_config = this->gui_app->get_tab(Preset::TYPE_FFF_FILAMENT)->get_config();
-    const DynamicPrintConfig* printer_config = this->gui_app->get_tab(Preset::TYPE_PRINTER)->get_config();
+    const DynamicPrintConfig* print_config = this->m_gui_app->get_tab(Preset::TYPE_FFF_PRINT)->get_config();
+    const DynamicPrintConfig* filament_config = this->m_gui_app->get_tab(Preset::TYPE_FFF_FILAMENT)->get_config();
+    const DynamicPrintConfig* printer_config = this->m_gui_app->get_tab(Preset::TYPE_PRINTER)->get_config();
 
-    Vec2d offset_dbl = conf.option<ConfigOptionPoint>("offset")->value;
-    wxSize offset(std::min(int(offset_dbl.x()), std::max(0, canvas->bmp.GetSize().x - 1)), std::min(int(offset_dbl.y()), std::max(0, canvas->bmp.GetSize().y - 1)));
-    Vec2d size_dbl = conf.option<ConfigOptionPoint>("size")->value;
-    wxSize size(std::min(int(size_dbl.x()), canvas->bmp.GetSize().x - offset.x), std::min(int(size_dbl.y()), canvas->bmp.GetSize().y - offset.y));
-    Vec2d pixel_size = conf.option<ConfigOptionPoint>("size_px")->value;
-    double separation = conf.opt_float("separation_xy");
-    double height = conf.opt_float("height");
-    double separation_z = conf.opt_float("separation_z");
+    Vec2d offset_dbl = m_config.option<ConfigOptionPoint>("offset")->value;
+    wxSize offset(std::min(int(offset_dbl.x()), std::max(0, m_canvas->bmp.GetSize().x - 1)), std::min(int(offset_dbl.y()), std::max(0, m_canvas->bmp.GetSize().y - 1)));
+    Vec2d size_dbl = m_config.option<ConfigOptionPoint>("size")->value;
+    wxSize size(std::min(int(size_dbl.x()), m_canvas->bmp.GetSize().x - offset.x), std::min(int(size_dbl.y()), m_canvas->bmp.GetSize().y - offset.y));
+    Vec2d pixel_size = m_config.option<ConfigOptionPoint>("size_px")->value;
+    double separation = m_config.opt_float("separation_xy");
+    double height = m_config.opt_float("height");
+    double separation_z = m_config.opt_float("separation_z");
     //double first_layer_height = print_config->get_computed_value("first_layer_height");
     double layer_height = print_config->get_computed_value("layer_height");
     if (separation_z > height)
@@ -911,17 +1492,17 @@ void CreateMMUTiledCanvas::create_geometry(wxCommandEvent& event_args) {
 
     Vec2d total_size{ size.x * (pixel_size.x() + separation) - separation, size.y * (pixel_size.y() + separation) - separation };
 
-    int nb_extruders = dynamic_cast<TabPrinter*>(this->gui_app->get_tab(Preset::TYPE_PRINTER))->m_extruders_count;
-    bool use_near_color = conf.option<ConfigOptionBool>("near_color")->value;
-    const int color_algo = conf.option<ConfigOptionInt>("color_comp")->value;
+    int nb_extruders = dynamic_cast<TabPrinter*>(this->m_gui_app->get_tab(Preset::TYPE_PRINTER))->m_extruders_count;
+    bool use_near_color = m_config.option<ConfigOptionBool>("near_color")->value;
+    const int color_algo = m_config.option<ConfigOptionInt>("color_comp")->value;
 
     std::vector<size_t> objs_idx;
     int idx_extruder_base = 0;
     if (use_near_color) {
         //find extruder
         wxColor color(0, 0, 0);
-        for (int i = 0; i < canvas->colours.size() && i < nb_extruders; i++) {
-            if (idx_extruder_base <= 0 || (color_dist(color_algo, canvas->colours[i].first, color) < color_dist(color_algo, canvas->colours[idx_extruder_base - 1].first, color))) {
+        for (int i = 0; i < used_colors.size() && i < nb_extruders; i++) {
+            if (idx_extruder_base <= 0 || (color_dist(color_algo, used_colors[i]->get_printed_color(), color) < color_dist(color_algo, used_colors[idx_extruder_base - 1]->get_printed_color(), color))) {
                 idx_extruder_base = 1 + i;
             }
         }
@@ -931,7 +1512,7 @@ void CreateMMUTiledCanvas::create_geometry(wxCommandEvent& event_args) {
         //phony volume
         mesh = TriangleMesh(its_make_cube(0.01, 0.01, 0.01));
     }
-    { //this->gui_app->obj_list()->load_mesh_object(mesh, _L("Base Tile"), false);
+    { //this->m_gui_app->obj_list()->load_mesh_object(mesh, _L("Base Tile"), false);
 #ifdef _DEBUG
         check_model_ids_validity(model);
 #endif /* _DEBUG */
@@ -959,8 +1540,8 @@ void CreateMMUTiledCanvas::create_geometry(wxCommandEvent& event_args) {
     objs_idx.push_back(0);
     
 
-    wxNativePixelData data(canvas->bmp);
-    wxNativePixelData::Iterator p(canvas->bmp, data);
+    wxNativePixelData data(m_canvas->bmp);
+    wxNativePixelData::Iterator p(m_canvas->bmp, data);
     if (offset.y > 0)
         p.OffsetY(data, offset.y);
     for (int y = 0; y < size.y; ++y) {
@@ -969,23 +1550,24 @@ void CreateMMUTiledCanvas::create_geometry(wxCommandEvent& event_args) {
             p.OffsetX(data, offset.x);
         for (int x = 0; x < size.x; x++, ++p) {
             wxColour color(p.Red(), p.Green(), p.Blue());
-            //change color if asked for
-            for (int i = 0; i < canvas->translate.size(); i++) {
-                if (canvas->translate[i].first == color) {
-                    color = canvas->translate[i].second;
-                    break;
+            //first check if there is an overide
+            for (ColorEntry& c : pixel_colors) {
+                if (c.real_color == color) {
+                    if (c.widget_spool && !c.widget_spool->is_auto()) {
+                        color = c.widget_spool->get_print_color()->get_printed_color();
+                    }
                 }
             }
             //find extruder
-            int idx_extruder = 0;
-            for (int i = 0; i < canvas->colours.size() && i < nb_extruders; i++) {
-                if (canvas->colours[i].first == color) {
-                    idx_extruder = 1 + i;
-                    break;
-                } else if (use_near_color && (idx_extruder <= 0 || (color_dist(color_algo, canvas->colours[i].first, color) < color_dist(color_algo, canvas->colours[idx_extruder - 1].first, color)))) {
-                    idx_extruder = 1 + i;
-                }
-            }
+            int idx_extruder = find_extruder(color);
+            //for (int i = 0; i < m_canvas->colours.size() && i < nb_extruders; i++) {
+            //    if (m_canvas->colours[i].first == color) {
+            //        idx_extruder = 1 + i;
+            //        break;
+            //    } else if (use_near_color && (idx_extruder <= 0 || (color_dist(color_algo, m_canvas->colours[i].first, color) < color_dist(color_algo, m_canvas->colours[idx_extruder - 1].first, color)))) {
+            //        idx_extruder = 1 + i;
+            //    }
+            //}
             //uncolored
             if (separation_z > 0) {
                 TriangleMesh mesh(its_make_cube(pixel_size.x(), pixel_size.y(), separation_z - layer_height));
@@ -1014,7 +1596,7 @@ void CreateMMUTiledCanvas::create_geometry(wxCommandEvent& event_args) {
 
 
     ////open file
-    //Plater* plat = this->main_frame->plater();
+    //Plater* plat = this->m_main_frame->plater();
     //Model& model = plat->model();
     //if(cmb_add_replace->GetSelection() == 0)
     //    plat->new_project();
@@ -1024,7 +1606,7 @@ void CreateMMUTiledCanvas::create_geometry(wxCommandEvent& event_args) {
     //for (int idx : objs_idx)
     //    model.objects[idx]->input_file = "";
     ///// --- translate ---
-    //const DynamicPrintConfig* printerConfig = this->gui_app->get_tab(Preset::TYPE_PRINTER)->get_config();
+    //const DynamicPrintConfig* printerConfig = this->m_gui_app->get_tab(Preset::TYPE_PRINTER)->get_config();
     //const ConfigOptionPoints* bed_shape = printerConfig->option<ConfigOptionPoints>("bed_shape");
     //Vec2d bed_size = BoundingBoxf(bed_shape->values).size();
     //Vec2d bed_min = BoundingBoxf(bed_shape->values).min;
@@ -1036,21 +1618,21 @@ void CreateMMUTiledCanvas::create_geometry(wxCommandEvent& event_args) {
         //{m_impl=L"#800040" m_convertedToChar={m_str=0x0000000000000000 <NULL> m_len=0 } }
         const ConfigOptionStrings* color_conf = printer_config->option<ConfigOptionStrings>("extruder_colour");
         ConfigOptionStrings* new_color_conf = static_cast<ConfigOptionStrings*>(color_conf->clone());
-        for(int idx_col = 0; idx_col < this->canvas->colours.size() && idx_col < new_color_conf->values.size(); idx_col++){
-            wxColour& col = this->canvas->colours[idx_col].first;
+        for(int idx_col = 0; idx_col < this->used_colors.size() && idx_col < new_color_conf->values.size(); idx_col++){
+            wxColour col = this->used_colors[idx_col]->get_printed_color();
             new_color_conf->values[idx_col] = "#" + AppConfig::int2hex(col.GetRGB());
         }
         new_Printer_config.set_key_value("extruder_colour", new_color_conf);
 
-        this->gui_app->get_tab(Preset::TYPE_PRINTER)->load_config(new_Printer_config);
-        this->main_frame->plater()->on_config_change(new_Printer_config);
-        this->gui_app->get_tab(Preset::TYPE_PRINTER)->update_dirty();
+        this->m_gui_app->get_tab(Preset::TYPE_PRINTER)->load_config(new_Printer_config);
+        this->m_main_frame->plater()->on_config_change(new_Printer_config);
+        this->m_gui_app->get_tab(Preset::TYPE_PRINTER)->update_dirty();
     }
 
     //update plater
     plat->changed_objects(objs_idx);
     //update everything, easier to code.
-    ObjectList* obj = this->gui_app->obj_list();
+    ObjectList* obj = this->m_gui_app->obj_list();
     obj->update_after_undo_redo();
 
     if (objs_idx.size() > 1)
